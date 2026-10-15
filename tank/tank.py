@@ -6,14 +6,20 @@
 #   chain: "eth" (Loogies, mainnet) or "op" (OptimisticLoogies). mouth: mouthLength, 0 = none (mainnet).
 # No save yet: a few demo loogies.
 #
+# USB ("usb": true: the app reads its own lines, like wedgie-safe; everything else goes to the slot):
+#   {"id":1,"type":"tank","loogies":[["op",7,"4fc822",81,188], ...]} -> {"id":1,"type":"tank_ok","n":16}
+#   hello answers carry "running": "tank" and "tank": how many loogies are in it.
+# Anyone plugged in can refill the tank without a press: it only ever changes this app's own save.
+#
 # Each loogie is drawn like its on-chain SVG (two eyes, a head ellipse chubbiness wide, a mouth curve),
 # scaled down, from the C ellipse/line calls. Its exact color comes from lcd.tint: the screen holds 16
 # colors, so up to 11 different loogie colors show at once; more share the nearest one.
 #
 # Joystick: pick a loogie (its number shows). Press: bubbles.
-import time, random, gc, math
+import sys, select, json, time, random, gc, math
 from lcd import LCD, Keys, tint
 import save
+import wedgie as W
 
 lcd = LCD()
 keys = Keys()
@@ -28,7 +34,7 @@ FLOOR = 222                         # where the sand starts
 DEMO = [["op", 7, "4fc822", 81, 188], ["eth", 7, "062200", 49, 0], ["op", 1, "e4572e", 100, 220],
         ["op", 2, "f3a712", 40, 160], ["eth", 3, "29335c", 70, 0], ["op", 4, "a8c686", 60, 200]]
 
-# one loogie: [x16, y16, dx16, dy16, slot, rx, phase, id, chain, mouth points (6 ints, facing left)]
+# one loogie: [x16, y16, dx16, dy16, slot, rx, phase, id, chain, mouth points (8 ints, facing left)]
 fish = []
 tints = []                          # (slot, r, g, b)
 sel = -1                            # the picked loogie, or -1
@@ -169,10 +175,82 @@ def pick(step):
     sel_until = time.ticks_add(time.ticks_ms(), 3000)
 
 
+def good(rows):
+    """The rows a host sent, checked: anything off and the whole list is refused."""
+    if not isinstance(rows, list):
+        raise ValueError("loogies: a list")
+    out = []
+    for r in rows[:MAX]:
+        if not (isinstance(r, list) and len(r) == 5 and r[0] in ("eth", "op")):
+            raise ValueError("a loogie: [chain, id, color, chubbiness, mouth]")
+        c = str(r[2]).lower().replace("#", "")
+        int(c, 16)
+        if len(c) != 6:
+            raise ValueError("color: rrggbb")
+        out.append([r[0], int(r[1]), c, max(0, min(255, int(r[3]))), max(0, min(255, int(r[4])))])
+    return out
+
+
+def handle(m):
+    mid, t = m.get("id"), m.get("type")
+    if t == "tank":
+        try:
+            rows = good(m.get("loogies"))
+        except (ValueError, TypeError) as e:
+            W.send({"id": mid, "type": "error", "error": "bad tank: %s" % e})
+            return
+        save.store("tank", {"loogies": rows})
+        load(rows)
+        gc.collect()
+        W.send({"id": mid, "type": "tank_ok", "n": len(rows)})
+    elif t == "hello":
+        W.send(W.hello(mid, running="tank", tank=len(fish)))
+    else:                               # hello's cousins, shots, jobs, open: the slot's
+        import slot
+        slot.handle(m)
+
+
+def pump(poll):
+    """One request per call, read through the one line reader (wedgie.lines)."""
+    R = W.lines()
+    line = R.pump(poll)
+    if R.intr:                          # a Ctrl-C while sealed: the red question (hatch.py)
+        R.intr = False
+        if W.SEALED and not W.is_open():
+            try:
+                import hatch
+                ok = hatch.ctrl_c()
+            except Exception as e:
+                sys.print_exception(e)
+                ok = False
+            if ok:
+                raise KeyboardInterrupt
+    if line is False:
+        W.send({"type": "error", "error": "line too long"})
+    elif line and line.strip():
+        try:
+            m = json.loads(line)
+        except Exception:
+            W.send({"type": "error", "error": "bad json"})
+            return
+        line = None
+        if not isinstance(m, dict):
+            return
+        try:
+            handle(m)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            W.failed(m.get("id"), e)
+
+
 def run():
     tank = save.load("tank", None)
     load(tank["loogies"] if tank else DEMO)
     gc.collect()
+    poll = select.poll()
+    poll.register(sys.stdin, select.POLLIN)
+    W.send(W.hello(None, type="ready", running="tank", tank=len(fish)))
     t = 0
     while True:
         t0 = time.ticks_ms()
@@ -185,6 +263,7 @@ def run():
                 for b in bubbles:
                     if not b[2]:
                         b[0], b[1], b[2] = random.randint(10, 230), FLOOR, random.randint(2, 4)
+        pump(poll)
         update(t)
         draw(t)
         lcd.show()
